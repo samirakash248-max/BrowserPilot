@@ -1,5 +1,5 @@
 /**
- * BrowserPilot AI - Live Dashboard Client Logic
+ * Klick AI - Live Dashboard Client Logic
  * Step 5: Visual Control Panel for Browser Automation
  * 
  * Owned by: Member B (Browser Automation Engineer)
@@ -571,7 +571,9 @@ async function runAutonomousAgentTask() {
   if (elAiThoughtPanel) elAiThoughtPanel.style.display = 'block';
 
   try {
-    const startUrl = (elBrowserUrl && elBrowserUrl.textContent !== 'about:blank')
+    const isMockUrl = elBrowserUrl && (elBrowserUrl.textContent.includes('mock-site') || elBrowserUrl.textContent.includes('8080') || elBrowserUrl.textContent === 'about:blank');
+    const isMockGoal = /invoice|inv-|apexflow|mock|crm|internal task/i.test(goal);
+    const startUrl = (elBrowserUrl && !isMockUrl) || (isMockUrl && isMockGoal)
       ? elBrowserUrl.textContent
       : undefined;
 
@@ -609,6 +611,12 @@ async function runCurrentTask() {
       return;
     }
   }
+
+  // Clear abort flag and ensure backend executor stop-lock is resumed
+  abortRequested = false;
+  try {
+    await fetch(`${API_BASE}/resume`, { method: 'POST' });
+  } catch (e) {}
 
   // 1. Autonomous Agent Mode
   if (currentExecutionMode === 'autonomous') {
@@ -717,6 +725,33 @@ async function resumeAgent() {
     await fetchRecentEvents();
   } catch (err) {
     console.error('Failed to dispatch resume request:', err);
+  }
+}
+
+/**
+ * Clean Reload Browser Session Handler
+ * Re-initializes browser environment, clears stop locks, and navigates to clean state
+ */
+async function reloadBrowserSession() {
+  const btn = document.getElementById('btn-reload-browser');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = '🔄 Reloading...';
+  }
+  abortRequested = false;
+  try {
+    await fetch(`${API_BASE}/reload`, { method: 'POST' });
+    setExecutionState('IDLE');
+    console.log('Browser session cleanly reloaded.');
+    await fetchRecentEvents();
+    await refreshObservation();
+  } catch (err) {
+    console.error('Failed to reload browser session:', err);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = '🔄 Reload Session';
+    }
   }
 }
 

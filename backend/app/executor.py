@@ -47,6 +47,91 @@ MIN_SCROLL_PIXELS = -2000
 
 MOCK_SITE_DIR = Path(__file__).resolve().parent.parent.parent / "mock-site"
 MOCK_SITE_DEFAULT_URL = f"file:///{(MOCK_SITE_DIR / 'index.html').as_posix()}"
+ALLOW_EXTERNAL_URLS = os.getenv("BROWSERPILOT_ALLOW_EXTERNAL", "true").lower() in ("true", "1", "yes")
+
+STEALTH_CHROME_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--no-sandbox",
+    "--disable-infobars",
+    "--disable-dev-shm-usage",
+    "--disable-features=IsolateOrigins,site-per-process",
+    "--no-first-run",
+    "--no-default-browser-check",
+]
+
+STEALTH_INIT_SCRIPT = """
+(() => {
+    // 1. Remove navigator.webdriver flag
+    try {
+        Object.defineProperty(navigator, 'webdriver', {
+            get: () => undefined,
+        });
+    } catch(e) {}
+
+    // 2. Mock window.chrome runtime and app
+    try {
+        if (!window.chrome) {
+            window.chrome = {};
+        }
+        window.chrome.runtime = window.chrome.runtime || {
+            OnInstalledReason: { CHROME_UPDATE: 'chrome_update', INSTALL: 'install' },
+            PlatformArch: { X86_64: 'x86-64' },
+            PlatformOs: { WIN: 'win' }
+        };
+        window.chrome.app = window.chrome.app || {
+            isInstalled: false,
+            InstallState: { DISABLED: 'DISABLED', INSTALLED: 'INSTALLED' },
+            RunningState: { CANNOT_RUN: 'CANNOT_RUN', READY_TO_RUN: 'READY_TO_RUN' }
+        };
+    } catch(e) {}
+
+    // 3. Mock languages
+    try {
+        Object.defineProperty(navigator, 'languages', {
+            get: () => ['en-US', 'en'],
+        });
+    } catch(e) {}
+
+    // 4. Mock plugins & mimeTypes
+    try {
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => {
+                const plugins = [
+                    { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+                    { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
+                    { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }
+                ];
+                plugins.item = (i) => plugins[i];
+                plugins.namedItem = (name) => plugins.find(p => p.name === name);
+                plugins.refresh = () => {};
+                return plugins;
+            },
+        });
+    } catch(e) {}
+
+    // 5. Override permissions.query
+    try {
+        if (navigator.permissions && navigator.permissions.query) {
+            const origQuery = navigator.permissions.query;
+            navigator.permissions.query = (params) => (
+                params && params.name === 'notifications' ?
+                    Promise.resolve({ state: Notification.permission }) :
+                    origQuery(params)
+            );
+        }
+    } catch(e) {}
+
+    // 6. WebGL vendor spoofing
+    try {
+        const getParameter = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function(parameter) {
+            if (parameter === 37445) return 'Google Inc. (Intel)';
+            if (parameter === 37446) return 'ANGLE (Intel, Intel(R) UHD Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)';
+            return getParameter.apply(this, arguments);
+        };
+    } catch(e) {}
+})();
+"""
 
 
 class PlaywrightExecutor:
@@ -57,9 +142,14 @@ class PlaywrightExecutor:
         page: Optional[Page] = None,
         headless: bool = False,
         slow_mo_ms: int = 100,
+        allow_external: Optional[bool] = None,
     ) -> None:
         self.headless = headless
         self.slow_mo_ms = slow_mo_ms
+        if allow_external is None:
+            self.allow_external = False
+        else:
+            self.allow_external = allow_external
         self._page: Optional[Page] = page
         self._context: Optional[BrowserContext] = None
         self._browser: Optional[Browser] = None
@@ -118,43 +208,70 @@ class PlaywrightExecutor:
                 pass
             self._page = None
 
-        if not self._playwright:
-            self._playwright = await async_playwright().start()
-
         viewport_size = {"width": 1440, "height": 900}
 
-        try:
-            # 1. Standard Playwright bundled Chromium
-            self._browser = await self._playwright.chromium.launch(
-                headless=self.headless,
-                slow_mo=self.slow_mo_ms,
-            )
-        except Exception:
-            # 2. Fallback to system-installed Chrome or Edge on Windows
+        # Resilient launch loop that self-heals broken pipes or loop mismatch across uvicorn reloads
+        for attempt in range(2):
             try:
-                self._browser = await self._playwright.chromium.launch(
-                    channel="chrome",
-                    headless=self.headless,
-                    slow_mo=self.slow_mo_ms,
-                )
-            except Exception:
-                self._browser = await self._playwright.chromium.launch(
-                    channel="msedge",
-                    headless=self.headless,
-                    slow_mo=self.slow_mo_ms,
-                )
+                if not self._playwright:
+                    self._playwright = await async_playwright().start()
 
-        self._context = await self._browser.new_context(viewport=viewport_size)
-        self._page = await self._context.new_page()
-        self._owns_browser = True
-        return self._page
+                browser = None
+                launch_errors = []
+                for channel in [None, "chrome", "msedge"]:
+                    try:
+                        kwargs = {
+                            "headless": self.headless,
+                            "slow_mo": self.slow_mo_ms,
+                            "args": STEALTH_CHROME_ARGS,
+                            "ignore_default_args": ["--enable-automation"],
+                        }
+                        if channel:
+                            kwargs["channel"] = channel
+                        browser = await self._playwright.chromium.launch(**kwargs)
+                        if browser:
+                            break
+                    except Exception as le:
+                        launch_errors.append(str(le))
+
+                if not browser:
+                    raise RuntimeError(f"Failed to launch browser: {'; '.join(launch_errors)}")
+
+                self._browser = browser
+                self._context = await self._browser.new_context(
+                    viewport=viewport_size,
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                    locale="en-US",
+                    timezone_id="America/New_York",
+                    color_scheme="light",
+                    device_scale_factor=1,
+                    has_touch=False,
+                    is_mobile=False,
+                    permissions=["geolocation"],
+                )
+                await self._context.add_init_script(STEALTH_INIT_SCRIPT)
+                self._page = await self._context.new_page()
+                self._owns_browser = True
+                return self._page
+            except Exception as exc:
+                try:
+                    if self._playwright:
+                        await self._playwright.stop()
+                except Exception:
+                    pass
+                self._playwright = None
+                self._browser = None
+                self._context = None
+                self._page = None
+                if attempt == 1:
+                    raise exc
 
     def _clean_agent_id(self, target: Optional[str]) -> Optional[str]:
         """Extract clean agent ID from target or selector string."""
         if not target:
             return None
         trimmed = target.strip()
-        match = re.match(r'^\[data-agent-id=["\']?([^"\'\]]+)["\']?\]$', trimmed)
+        match = re.search(r'data-agent-id=["\']?([^"\'\]]+)["\']?', trimmed)
         if match:
             return match.group(1)
         return trimmed
@@ -162,10 +279,7 @@ class PlaywrightExecutor:
     async def _resolve_target(
         self, page: Page, target: Optional[str], action_name: str
     ) -> Tuple[Optional[Locator], Optional[str], Optional[ExecutionResult]]:
-        """Resolve target through exact data-agent-id match.
-        
-        Rejects missing or ambiguous targets.
-        """
+        """Resolve target through exact data-agent-id match or CSS fallback."""
         if not target or not target.strip():
             return (
                 None,
@@ -185,6 +299,25 @@ class PlaywrightExecutor:
         count = await locator.count()
 
         if count == 0:
+            # Fallback for real-world websites where elements may have standard CSS selectors or attributes
+            fallback_candidates = [
+                clean_id,
+                f"#{clean_id}",
+                f'[name="{clean_id}"]',
+                f'[aria-label="{clean_id}"]',
+                f'[placeholder="{clean_id}"]',
+                f'button:has-text("{clean_id}")',
+                f'a:has-text("{clean_id}")',
+                f'text="{clean_id}"',
+            ]
+            for cand in fallback_candidates:
+                try:
+                    cand_loc = page.locator(cand)
+                    if await cand_loc.count() > 0:
+                        return (cand_loc.first, clean_id, None)
+                except Exception:
+                    continue
+
             return (
                 None,
                 clean_id,
@@ -199,18 +332,13 @@ class PlaywrightExecutor:
             )
 
         if count > 1:
-            return (
-                None,
-                clean_id,
-                ExecutionResult(
-                    success=False,
-                    action_type=ActionType(action_name),
-                    action=action_name,
-                    target=clean_id,
-                    message=f"Ambiguous target: {count} elements found matching data-agent-id '{clean_id}'",
-                    error="Ambiguous target",
-                ),
-            )
+            try:
+                visible_loc = locator.locator("visible=true")
+                if await visible_loc.count() > 0:
+                    return (visible_loc.first, clean_id, None)
+            except Exception:
+                pass
+            return (locator.first, clean_id, None)
 
         return (locator, clean_id, None)
 
@@ -285,6 +413,8 @@ class PlaywrightExecutor:
                 return False
 
         if parsed.scheme in ("http", "https"):
+            if self.allow_external:
+                return True
             hostname = (parsed.hostname or "").lower()
             if hostname in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
                 return True
@@ -293,6 +423,179 @@ class PlaywrightExecutor:
         # Local HTML filenames or anchors
         if not parsed.scheme and (clean_url.endswith(".html") or clean_url.endswith(".htm") or "#" in clean_url):
             return True
+
+        return False
+
+    async def detect_captcha(self, page: Optional[Page] = None) -> Dict[str, Any]:
+        """Detect if the active or specified page is challenged by a CAPTCHA or blocking wall."""
+        p = page or self.current_page
+        if not p or p.is_closed():
+            return {"present": False, "type": "none", "details": ""}
+
+        url = (p.url or "").lower()
+        try:
+            title = (await p.title() or "").lower()
+        except Exception:
+            title = ""
+
+        try:
+            page_text = (await p.evaluate("() => (document.body ? document.body.innerText : '')") or "").lower()
+        except Exception:
+            page_text = ""
+
+        # 1. Google "unusual traffic" / sorry
+        if "/sorry/index" in url or "unusual traffic" in title or "unusual traffic from your computer network" in page_text:
+            return {"present": True, "type": "google_unusual_traffic", "details": "Google unusual traffic challenge"}
+
+        # 2. Cloudflare Turnstile / Challenge Page
+        if any(cf_marker in title for cf_marker in ("just a moment...", "attention required! | cloudflare", "cloudflare")):
+            return {"present": True, "type": "cloudflare", "details": "Cloudflare waiting room / challenge"}
+
+        try:
+            for frame in p.frames:
+                f_url = frame.url.lower()
+                if "challenges.cloudflare.com" in f_url or "turnstile" in f_url:
+                    return {"present": True, "type": "cloudflare_turnstile", "details": "Cloudflare Turnstile iframe"}
+        except Exception:
+            pass
+
+        try:
+            if await p.locator("iframe[src*='challenges.cloudflare.com'], #cf-turnstile, .cf-turnstile").count() > 0:
+                return {"present": True, "type": "cloudflare_turnstile", "details": "Cloudflare Turnstile element"}
+        except Exception:
+            pass
+
+        # 3. Google reCAPTCHA
+        try:
+            for frame in p.frames:
+                f_url = frame.url.lower()
+                if "recaptcha" in f_url:
+                    return {"present": True, "type": "recaptcha", "details": "Google reCAPTCHA iframe"}
+        except Exception:
+            pass
+
+        try:
+            if await p.locator("iframe[src*='recaptcha'], iframe[title*='reCAPTCHA'], #g-recaptcha, .g-recaptcha").count() > 0:
+                return {"present": True, "type": "recaptcha", "details": "Google reCAPTCHA element"}
+        except Exception:
+            pass
+
+        # 4. hCaptcha
+        try:
+            for frame in p.frames:
+                if "hcaptcha.com" in frame.url.lower():
+                    return {"present": True, "type": "hcaptcha", "details": "hCaptcha iframe"}
+            if await p.locator("iframe[src*='hcaptcha.com'], .h-captcha").count() > 0:
+                return {"present": True, "type": "hcaptcha", "details": "hCaptcha element"}
+        except Exception:
+            pass
+
+        # 5. Google Cookie Consent Wall (blocks search results / input in many regions)
+        try:
+            consent_locators = p.locator("#L2AGLb, #W0wltc, button:has-text('Accept all'), button:has-text('I agree'), button:has-text('Tout accepter'), button:has-text('Alle akzeptieren')")
+            if await consent_locators.count() > 0 and await consent_locators.first.is_visible():
+                return {"present": True, "type": "google_consent", "details": "Google Cookie Consent Modal"}
+        except Exception:
+            pass
+
+        # 6. Generic human verification text in body
+        if any(phrase in page_text for phrase in ("verify you are human", "please verify that you are not a robot", "complete the security check to continue")):
+            return {"present": True, "type": "generic_challenge", "details": "Human verification challenge text"}
+
+        return {"present": False, "type": "none", "details": ""}
+
+    async def handle_captcha(self, page: Optional[Page] = None, timeout_seconds: float = 8.0) -> bool:
+        """Attempt automatic resolution / dismissal of CAPTCHAs, challenges, and consent walls."""
+        p = page or self.current_page
+        if not p or p.is_closed():
+            return False
+
+        detection = await self.detect_captcha(p)
+        if not detection.get("present"):
+            return True
+
+        c_type = detection.get("type")
+        start_time = time.monotonic()
+
+        # Case 1: Google Consent Modal
+        if c_type == "google_consent":
+            consent_selectors = [
+                "#L2AGLb",
+                "button:has-text('Accept all')",
+                "button:has-text('I agree')",
+                "button:has-text('Agree')",
+                "button:has-text('Tout accepter')",
+                "button:has-text('Alle akzeptieren')",
+                "#W0wltc",
+                "button:has-text('Reject all')",
+            ]
+            for sel in consent_selectors:
+                try:
+                    btn = p.locator(sel)
+                    if await btn.count() > 0 and await btn.first.is_visible():
+                        await btn.first.click(timeout=1500)
+                        await p.wait_for_timeout(500)
+                        return True
+                except Exception:
+                    continue
+
+        # Case 2: Cloudflare Turnstile
+        if c_type in ("cloudflare", "cloudflare_turnstile"):
+            clicked = False
+            for frame in p.frames:
+                f_url = frame.url.lower()
+                if "challenges.cloudflare.com" in f_url or "turnstile" in f_url:
+                    try:
+                        candidates = ["input[type='checkbox']", "#challenge-stage", ".ctp-checkbox-label", "span.mark"]
+                        for c_sel in candidates:
+                            loc = frame.locator(c_sel)
+                            if await loc.count() > 0:
+                                await loc.first.click(timeout=2000)
+                                clicked = True
+                                break
+                        if clicked:
+                            break
+                    except Exception:
+                        pass
+
+            if not clicked:
+                try:
+                    cf_stage = p.locator("#challenge-stage, .cf-turnstile, [data-sitekey]")
+                    if await cf_stage.count() > 0:
+                        await cf_stage.first.click(timeout=1500)
+                except Exception:
+                    pass
+
+        # Case 3: Google reCAPTCHA
+        if c_type in ("recaptcha", "google_unusual_traffic"):
+            for frame in p.frames:
+                if "recaptcha" in frame.url.lower():
+                    try:
+                        anchor = frame.locator("#recaptcha-anchor, .recaptcha-checkbox-border, .recaptcha-checkbox")
+                        if await anchor.count() > 0:
+                            await anchor.first.click(timeout=2000)
+                            break
+                    except Exception:
+                        pass
+
+        # Case 4: hCaptcha
+        if c_type == "hcaptcha":
+            for frame in p.frames:
+                if "hcaptcha.com" in frame.url.lower():
+                    try:
+                        cb = frame.locator("#checkbox, [aria-haspopup='true']")
+                        if await cb.count() > 0:
+                            await cb.first.click(timeout=2000)
+                            break
+                    except Exception:
+                        pass
+
+        # Polling wait loop: check if challenge clears (auto-solved or human-solved)
+        while (time.monotonic() - start_time) < timeout_seconds:
+            await asyncio.sleep(0.8)
+            current_check = await self.detect_captcha(p)
+            if not current_check.get("present"):
+                return True
 
         return False
 
@@ -397,6 +700,68 @@ class PlaywrightExecutor:
                 error=str(exc),
             )
 
+    async def _animate_cursor(
+        self,
+        page: Page,
+        locator: Optional[Locator] = None,
+        x: Optional[float] = None,
+        y: Optional[float] = None,
+        is_click: bool = False,
+    ) -> None:
+        """Render and smoothly animate a visual cursor indicator on the page."""
+        try:
+            target_x = x
+            target_y = y
+            if locator is not None:
+                box = await locator.bounding_box()
+                if box:
+                    target_x = box["x"] + box["width"] / 2
+                    target_y = box["y"] + box["height"] / 2
+
+            if target_x is None or target_y is None:
+                return
+
+            # Inject / update visual cursor in DOM with smooth CSS bezier transition
+            await page.evaluate("""([tx, ty, clickAnim]) => {
+                let cur = document.getElementById('__bp_agent_cursor__');
+                if (!cur) {
+                    cur = document.createElement('div');
+                    cur.id = '__bp_agent_cursor__';
+                    cur.innerHTML = `
+                      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" style="pointer-events: none !important; filter: drop-shadow(0 2px 6px rgba(0,0,0,0.7)); transform: translate(-2px, -2px);">
+                        <path d="M5.5 3.21V20.8c0 .45.54.67.85.35l4.86-4.86a.5.5 0 0 1 .35-.15h6.87c.45 0 .67-.54.35-.85L6.35 2.85a.5.5 0 0 0-.85.36z" fill="#00e5ff" stroke="#0f172a" stroke-width="1.6" style="pointer-events: none !important;"/>
+                      </svg>
+                      <div id="__bp_ripple__" style="position: absolute; top: -10px; left: -10px; width: 40px; height: 40px; border-radius: 50%; border: 3px solid #00e5ff; pointer-events: none !important; opacity: 0; transform: scale(0.3); transition: transform 0.35s ease-out, opacity 0.35s ease-out;"></div>
+                    `;
+                    cur.style.position = 'fixed';
+                    cur.style.zIndex = '2147483647';
+                    cur.style.pointerEvents = 'none';
+                    cur.style.transition = 'left 0.35s cubic-bezier(0.2, 0.8, 0.2, 1), top 0.35s cubic-bezier(0.2, 0.8, 0.2, 1)';
+                    cur.style.left = `${tx}px`;
+                    cur.style.top = `${ty}px`;
+                    document.documentElement.appendChild(cur);
+                }
+                cur.style.left = `${tx}px`;
+                cur.style.top = `${ty}px`;
+                if (clickAnim) {
+                    const rip = document.getElementById('__bp_ripple__');
+                    if (rip) {
+                        rip.style.transform = 'scale(1.5)';
+                        rip.style.opacity = '1';
+                        setTimeout(() => {
+                            rip.style.transform = 'scale(0.3)';
+                            rip.style.opacity = '0';
+                        }, 300);
+                    }
+                }
+            }""", [target_x, target_y, is_click])
+
+            # Move physical mouse with Playwright steps
+            await page.mouse.move(target_x, target_y, steps=5)
+            await page.wait_for_timeout(180)
+        except Exception:
+            pass
+
     async def _execute_click(self, page: Page, target: Optional[str]) -> ExecutionResult:
         """Perform click action with exact data-agent-id target resolution."""
         locator, clean_id, error_result = await self._resolve_target(page, target, "click")
@@ -407,17 +772,39 @@ class PlaywrightExecutor:
         try:
             await locator.wait_for(state="visible", timeout=3000)
         except Exception:
-            return ExecutionResult(
-                success=False,
-                action_type=ActionType.CLICK,
-                action="click",
-                target=clean_id,
-                message=f"Target '{clean_id}' is not visible on the page",
-                error="Element not visible",
-            )
+            try:
+                await locator.scroll_into_view_if_needed(timeout=2000)
+            except Exception:
+                return ExecutionResult(
+                    success=False,
+                    action_type=ActionType.CLICK,
+                    action="click",
+                    target=clean_id,
+                    message=f"Target '{clean_id}' is not visible on the page",
+                    error="Element not visible",
+                )
 
-        # Execute click
-        await locator.click(timeout=DEFAULT_ACTION_TIMEOUT_MS)
+        # Smoothly move visual cursor to target element with click pulse animation
+        await self._animate_cursor(page, locator=locator, is_click=True)
+
+        # Execute click with resilient fallback
+        try:
+            await locator.scroll_into_view_if_needed(timeout=2000)
+        except Exception:
+            pass
+
+        try:
+            await locator.click(timeout=DEFAULT_ACTION_TIMEOUT_MS)
+        except Exception as click_err:
+            try:
+                # Force click to bypass overlay / pointer-events interception
+                await locator.click(timeout=2000, force=True)
+            except Exception:
+                try:
+                    await locator.dispatch_event("click")
+                except Exception:
+                    raise click_err
+
         await page.wait_for_timeout(150)
 
         # Verify what happened after click without blindly assuming success
@@ -433,6 +820,12 @@ class PlaywrightExecutor:
             msg = f"Executed invoice search with '{clean_id}'"
         else:
             msg = f"Clicked element with agent ID '{clean_id}'"
+
+        # Check if clicking triggered a consent banner or challenge
+        try:
+            await self.handle_captcha(page, timeout_seconds=2.0)
+        except Exception:
+            pass
 
         return ExecutionResult(
             success=True,
@@ -476,6 +869,8 @@ class PlaywrightExecutor:
             )
 
         text_to_type = text if text is not None else ""
+        # Smoothly move visual cursor to target input element
+        await self._animate_cursor(page, locator=locator, is_click=False)
         await locator.fill(text_to_type, timeout=DEFAULT_ACTION_TIMEOUT_MS)
         await page.wait_for_timeout(100)
 
@@ -562,7 +957,8 @@ class PlaywrightExecutor:
             else:
                 _, sep, hash_part = target_url.partition("#")
 
-            await page.goto(target_url, wait_until="domcontentloaded", timeout=DEFAULT_ACTION_TIMEOUT_MS * 2)
+            nav_timeout = (DEFAULT_ACTION_TIMEOUT_MS * 5) if self.allow_external else (DEFAULT_ACTION_TIMEOUT_MS * 2)
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=nav_timeout)
             if hash_part:
                 await page.evaluate(f"""() => {{
                     if (typeof navigateTo === 'function') {{
@@ -570,6 +966,12 @@ class PlaywrightExecutor:
                     }}
                 }}""")
             await page.wait_for_timeout(100)
+
+            # Auto-dismiss cookie consent modal (Google) or solve challenge
+            try:
+                await self.handle_captcha(page, timeout_seconds=3.0)
+            except Exception:
+                pass
 
         current_url = page.url
         title = await page.title()

@@ -139,33 +139,43 @@ def is_action_grounded(action: BrowserAction, observation: PageObservation) -> b
         return True
 
     # Global keypress without target element is allowed
-    if action.action_type == ActionType.PRESS_KEY and not action.selector:
+    if action.action_type == ActionType.PRESS_KEY and not action.selector and not action.target:
         return True
 
-    if not action.selector:
+    target_val = action.selector or action.target
+    if not target_val:
         return False
 
-    sel = action.selector.strip()
+    sel = target_val.strip()
     norm_sel = sel.replace("'", '"')
     raw_sel_id = sel.lstrip("#")
+    clean_agent_id = None
+    m = re.search(r'data-agent-id=["\']?([^"\'\]]+)["\']?', sel)
+    if m:
+        clean_agent_id = m.group(1)
 
-    # 1. Exact match against structured interactive_elements fields
+    # 1. Match against structured interactive_elements fields
     for el in observation.interactive_elements:
         if el.selector:
             el_sel = el.selector.strip()
             if el_sel == sel or el_sel.replace("'", '"') == norm_sel:
                 return True
+            if clean_agent_id and (f'data-agent-id="{clean_agent_id}"' in el_sel or f"data-agent-id='{clean_agent_id}'" in el_sel):
+                return True
         if el.id:
             clean_id = el.id.strip()
-            if sel == clean_id or sel == f"#{clean_id}" or raw_sel_id == clean_id:
+            if sel == clean_id or sel == f"#{clean_id}" or raw_sel_id == clean_id or clean_agent_id == clean_id:
                 return True
             if norm_sel == f'[data-agent-id="{clean_id}"]' or sel == f"[data-agent-id='{clean_id}']":
                 return True
 
-    # 2. Strict check for explicit selector declarations formatted in dom_summary
-    # Observer formats entries strictly as: `-> selector: `{el.selector}``
+    # 2. Check for selector declarations formatted in dom_summary
     if observation.dom_summary:
         if f"selector: `{sel}`" in observation.dom_summary or f"selector: `{norm_sel}`" in observation.dom_summary:
+            return True
+        if clean_agent_id and f"data-agent-id=\"{clean_agent_id}\"" in observation.dom_summary:
+            return True
+        if clean_agent_id and f"data-agent-id='{clean_agent_id}'" in observation.dom_summary:
             return True
 
     return False
@@ -473,23 +483,58 @@ class ControlledAgentRunner:
             state.status = RunStatus.RUNNING
 
             # Initial navigation if requested
-            if request.start_url:
+            if request.start_url and hasattr(self.executor, "execute"):
                 nav_action = BrowserAction(
                     action_type=ActionType.NAVIGATE,
                     url=request.start_url,
                     description=f"Initial navigation to {request.start_url}",
                 )
-                nav_res = await self.executor.execute(nav_action)
-                if not nav_res.success:
-                    stop_reason = StopReason.EXECUTION_FAILED
-                    state.status = RunStatus.FAILED
-                    state.error = f"Failed initial navigation: {nav_res.error}"
-                    return state
+                exec_ret = self.executor.execute(nav_action)
+                if asyncio.iscoroutine(exec_ret):
+                    nav_res = await exec_ret
+                    if hasattr(nav_res, "success") and not nav_res.success:
+                        stop_reason = StopReason.EXECUTION_FAILED
+                        state.status = RunStatus.FAILED
+                        state.error = f"Failed initial navigation: {getattr(nav_res, 'error', 'navigation error')}"
+                        return state
 
             # 2. Controlled Execution Loop
             while state.current_step < state.max_steps and not self._stop_requested:
                 state.current_step += 1
                 step_idx = state.current_step
+
+                # A0. Pre-observation CAPTCHA / challenge handling
+                if hasattr(self.executor, "detect_captcha") and hasattr(self.executor, "handle_captcha"):
+                    try:
+                        c_check = self.executor.detect_captcha(active_page)
+                        if asyncio.iscoroutine(c_check):
+                            captcha_status = await c_check
+                        else:
+                            captcha_status = c_check
+
+                        if isinstance(captcha_status, dict) and captcha_status.get("present"):
+                            c_type = captcha_status.get("type", "unknown")
+                            await self.events.emit(
+                                EventType.STATUS_CHANGE,
+                                f"CAPTCHA or security challenge detected ({c_type}). Attempting resolution...",
+                                {"captcha": captcha_status, "step": step_idx},
+                                run_id=run_id,
+                            )
+                            h_res = self.executor.handle_captcha(active_page, timeout_seconds=12.0)
+                            if asyncio.iscoroutine(h_res):
+                                resolved = await h_res
+                            else:
+                                resolved = bool(h_res)
+
+                            if resolved:
+                                await self.events.emit(
+                                    EventType.STATUS_CHANGE,
+                                    "CAPTCHA or challenge resolved successfully.",
+                                    {"captcha": captcha_status, "resolved": True, "step": step_idx},
+                                    run_id=run_id,
+                                )
+                    except Exception:
+                        pass
 
                 # A. Fresh Observation (always re-observe after action)
                 try:

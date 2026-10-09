@@ -63,6 +63,7 @@ class AgentLoop:
         run_id = str(uuid.uuid4())
         self._is_running = True
         self._stop_requested = False
+        self.executor.resume()
 
         state = AgentRunState(
             run_id=run_id,
@@ -85,13 +86,32 @@ class AgentLoop:
             page = await self.executor.initialize()
             state.status = RunStatus.RUNNING
 
-            # Initial navigation if requested
-            if request.start_url:
+            # Initial navigation if requested or inferred from goal
+            target_url = request.start_url
+            goal_lower = request.goal.lower()
+
+            is_mock_url = not target_url or "mock-site" in target_url or "localhost" in target_url or "127.0.0.1" in target_url
+            is_mock_goal = any(k in goal_lower for k in ("invoice", "apexflow", "mock", "inv-", "internal task"))
+
+            # Default to google.com for any general search or web request
+            if not target_url or (is_mock_url and not is_mock_goal):
+                if any(w in goal_lower for w in ("map", "maps", "route", "direction")):
+                    target_url = "https://www.google.com/maps"
+                elif "wikipedia" in goal_lower:
+                    target_url = "https://www.wikipedia.org"
+                elif "flipkart" in goal_lower:
+                    target_url = "https://www.flipkart.com"
+                elif "amazon" in goal_lower:
+                    target_url = "https://www.amazon.com"
+                else:
+                    target_url = "https://www.google.com"
+
+            if target_url:
                 await self.executor.execute(
                     BrowserAction(
                         action_type=ActionType.NAVIGATE,
-                        url=request.start_url,
-                        description=f"Initial navigation to {request.start_url}",
+                        url=target_url,
+                        description=f"Initial navigation to {target_url}",
                     )
                 )
 
@@ -99,6 +119,36 @@ class AgentLoop:
             while state.current_step < state.max_steps and not self._stop_requested:
                 state.current_step += 1
                 step_idx = state.current_step
+
+                # A0. Pre-Observation CAPTCHA / Security Challenge Resolution
+                if hasattr(self.executor, "detect_captcha") and hasattr(self.executor, "handle_captcha"):
+                    try:
+                        captcha_status = await self.executor.detect_captcha(page)
+                        if captcha_status.get("present"):
+                            c_type = captcha_status.get("type", "unknown")
+                            await event_manager.emit(
+                                EventType.STATUS_CHANGE,
+                                f"CAPTCHA or security challenge detected ({c_type}). Attempting resolution...",
+                                {"captcha": captcha_status, "step": step_idx},
+                                run_id=run_id,
+                            )
+                            resolved = await self.executor.handle_captcha(page, timeout_seconds=12.0)
+                            if resolved:
+                                await event_manager.emit(
+                                    EventType.STATUS_CHANGE,
+                                    "CAPTCHA or challenge resolved successfully.",
+                                    {"captcha": captcha_status, "resolved": True, "step": step_idx},
+                                    run_id=run_id,
+                                )
+                            else:
+                                await event_manager.emit(
+                                    EventType.SAFETY_ALERT,
+                                    "CAPTCHA challenge detected. If browser window is open, please solve it.",
+                                    {"captcha": captcha_status, "resolved": False, "step": step_idx},
+                                    run_id=run_id,
+                                )
+                    except Exception:
+                        pass
 
                 # A. Observe Page
                 observation = await self.observer.observe(page)

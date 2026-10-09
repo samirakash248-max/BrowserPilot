@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>BrowserPilot AI - Live Control Panel</title>
+  <title>Klick AI - Live Control Panel</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -11,9 +11,9 @@
     <!-- Top Bar Navigation -->
     <header class="dashboard-header">
       <div class="brand">
-        <div class="brand-logo">BP</div>
+        <div class="brand-logo">K</div>
         <div class="brand-text">
-          <h1>BrowserPilot AI</h1>
+          <h1>Klick AI</h1>
           <span class="brand-subtitle">Autonomous Browser Control Plane</span>
         </div>
       </div>
@@ -24,6 +24,11 @@
           <span class="status-dot dot-checking" id="backend-status-dot"></span>
           <span class="status-label" id="backend-status-text">CONNECTING...</span>
         </div>
+
+        <!-- Reload / Reset Session Button -->
+        <button type="button" class="btn btn-secondary btn-sm" id="btn-reload-browser" onclick="reloadBrowserSession()" title="Cleanly reset browser session and clear stop locks" style="padding: 4px 10px; font-size: 12px; cursor: pointer;">
+          🔄 Reload Session
+        </button>
 
         <!-- Agent Execution Lifecycle Badge -->
         <div class="badge status-idle" id="agent-status-badge">

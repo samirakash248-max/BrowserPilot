@@ -1,8 +1,8 @@
-# BrowserPilot AI
+# Klick
 
 > **A local-first, privacy-respecting autonomous browser agent powered by Ollama (Gemma 3 4B), Playwright, and FastAPI.**
 
-BrowserPilot AI executes end-to-end web navigation tasks autonomously on your machine without routing sensitive browser telemetry or credentials to cloud API providers.
+Klick executes end-to-end web navigation tasks autonomously on your machine without routing sensitive browser telemetry or credentials to cloud API providers.
 
 ---
 
@@ -172,4 +172,4 @@ ollama run gemma3:4b
 - [x] **Milestone 1**: Clean, modular monorepo scaffold with schemas, mock site, dashboard, and test suites.
 - [ ] **Milestone 2**: Parallel implementation of core AI brain prompts and Playwright accessibility tree walker.
 - [ ] **Milestone 3**: End-to-end integration with live Ollama inference and automated QA test runs.
-- [ ] **Milestone 4 (Future)**: Optional Manifest V3 Chrome extension bridge.
+- [x] **Milestone 4**: Manifest V3 Chrome extension ("Klick") with custom task builder and in-tab execution.

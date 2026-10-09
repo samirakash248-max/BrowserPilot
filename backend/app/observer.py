@@ -206,8 +206,14 @@ class PlaywrightObserver:
                 
                 // 3. Extract attributes
                 const tag = el.tagName.toLowerCase();
-                const agentId = el.getAttribute('data-agent-id') || null;
+                let agentId = el.getAttribute('data-agent-id');
                 const domId = el.id || null;
+                if (!agentId) {
+                    agentId = domId ? ('id-' + domId) : ('elem-' + results.length);
+                    try {
+                        el.setAttribute('data-agent-id', agentId);
+                    } catch (e) {}
+                }
                 const rawType = el.getAttribute('type');
                 const inputType = tag === 'input' ? (rawType || 'text').toLowerCase() : null;
                 

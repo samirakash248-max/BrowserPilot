@@ -52,8 +52,10 @@ def sample_observation() -> PageObservation:
     )
 
 
-def test_default_model_selection():
-    """Verify default model tag is gemma4:e2b."""
+def test_default_model_selection(monkeypatch):
+    """Verify default model tag is gemma4:e2b when no env vars are set."""
+    monkeypatch.delenv(MODEL_ENV_VAR, raising=False)
+    monkeypatch.delenv(FALLBACK_ENV_VAR, raising=False)
     client = OllamaModelClient()
     assert client.model == "gemma4:e2b"
 
